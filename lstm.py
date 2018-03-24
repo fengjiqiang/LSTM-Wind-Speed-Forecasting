@@ -34,44 +34,7 @@ import json
 import pandas as pd
 import numpy as np
 
-nems4_lookahead = 12
-
-def read_nems4(years, prediction_hours=12):
-    predictions=pd.DataFrame()
-    for year in years:
-        with open('../data/NEMS4/{}.json'.format(year)) as json_data:
-            d = json.load(json_data)
-            if not predictions.empty:
-                predictions = predictions.append(pd.DataFrame(d['history_1h']))
-            else:
-                predictions = pd.DataFrame(d['history_1h'])
-
-    predictions = predictions.set_index('time')
-    predictions.index.name = 'timestamp'
-    
-    # shift dataset back 12 hours as its a the value is the prediction for the given timestmap 12 hours previously
-    predictions.index = pd.to_datetime(predictions.index) - pd.Timedelta(hours=nems4_lookahead)
-    predictions.index.tz = 'UTC'
-
-    predictions = predictions[['temperature', 'precipitation', 
-                   'relativehumidity', 'sealevelpressure', 
-                   'windspeed', 'winddirection']]
-    
-    predictions = predictions.rename(columns={
-        'windspeed': 'nems4_wind_speed',
-        'winddirection': 'nems4_wind_direction', 
-        'temperature': 'nems4_AT',
-        'precipitation': 'nems4_precipitation',
-        'relativehumidity': 'nems4_humidity',
-        'sealevelpressure': 'nems4_pressure'})
-    
-    return predictions
-
-
-# In[ ]:
-
 years = range(2013, 2018)
-# dataset = pd.merge(read_observations(years), read_nems4(years), left_index=True, right_index=True, how='inner')
 dataset = read_observations(years)
 
 original = dataset.copy(deep=True)
@@ -170,8 +133,6 @@ def invert_all_prediction_differences(predictions, original):
         
     return inverted
 
-
-# In[ ]:
 
 dataset = drop_duplicates(dataset)
 dataset = impute_missing(dataset)
@@ -335,13 +296,15 @@ for i, horizon in enumerate(horizons):
         undiff_prediction[:-horizon,i]) < 1e-10)
 
 
+filename = os.path.basename(__file__)
+batch_size = 1024
+epochs = 300
 
-# ### Build the LSTM Model
+# Build the LSTM Model
 
-# In[10]:
 import keras
 from keras.models import Sequential
-from keras.layers import Dense, Activation, Dropout, RepeatVector, TimeDistributed
+from keras.layers import Dense, Activation, Dropout
 from keras.layers import Conv1D, MaxPooling1D
 from keras.layers import LSTM, GRU, SimpleRNN
 from keras.callbacks import EarlyStopping, ModelCheckpoint
@@ -356,8 +319,12 @@ from keras import losses
 def build_model(layers):
     model = Sequential()
 
-    model.add(LSTM(64, input_shape=(None, layers[0]), return_sequences=True))
-    model.add(Dropout(0.2))
+    model.add(LSTM(64, 
+            dropout=0.2, 
+            recurrent_dropout=0.1, 
+            input_shape=(sequence_length, layers[0]), 
+            return_sequences=True))
+    # model.add(Dropout(0.2))
     
     model.add(LSTM(64, return_sequences=True))
     model.add(Dropout(0.2))
@@ -365,18 +332,21 @@ def build_model(layers):
     model.add(LSTM(16))
     model.add(Dropout(0.2))
 
+    model.add(Dense(64, activation='linear'))
+    model.add(Dense(64, activation='linear'))
+
     model.add(Dense(layers[1]))
     model.add(Activation('linear'))
     
     model.compile(loss='mae', optimizer='rmsprop')
     
     print(model.summary())
-    plot_model(model, to_file='./model/model.png', show_shapes=True)
+    plot_model(model, to_file='./model/model_'+filename+'.png', show_shapes=True)
           
     return model
 
 
-def run_network(X_train, y_train, X_test, y_test, layers, epochs, batch_size=1024):
+def run_network(X_train, y_train, X_test, y_test, layers, epochs, batch_size=batch_size):
     model = build_model(layers)
     history = None
     
@@ -387,11 +357,11 @@ def run_network(X_train, y_train, X_test, y_test, layers, epochs, batch_size=102
             epochs=epochs,
             validation_split=0.1,
             callbacks=[
-                TensorBoard(log_dir='./tensorboard', write_graph=True),
+                TensorBoard(log_dir='./logs', write_graph=True),
                 ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=60, 
                                 verbose=1, mode='auto', min_lr=0.0001),
                 EarlyStopping(monitor='val_loss', patience=80, verbose=1, mode='auto'),
-                ModelCheckpoint('./model/best.hdf5', monitor='val_loss', verbose=1, 
+                ModelCheckpoint('./model/best_'+filename+'.hdf5', monitor='val_loss', verbose=1, 
                                 save_best_only=True, mode='auto')
             ])
     except KeyboardInterrupt:
@@ -403,15 +373,13 @@ def run_network(X_train, y_train, X_test, y_test, layers, epochs, batch_size=102
     return model, predicted, history, scores
 
 
-# In[29]:
-
 model, predicted, history, scores = run_network(
     X_train, 
     y_train, 
     X_test,
     y_test,
     layers = [X_train.shape[2], y_train.shape[1]],
-    epochs=100)
+    epochs=epochs)
 
 
 print(scores)
@@ -426,23 +394,9 @@ fig = plt.figure(figsize=(12, 5))
 plt.plot(history.history['loss'], label='train_loss')
 plt.plot(history.history['val_loss'], label='val_loss')
 plt.legend()
+plt.xlabel('epoch')
 plt.savefig('./image/loss_' + filename + '.png')
 plt.show()
-
-# accuracy
-# fig = plt.figure(figsize=(12, 5))
-# plt.plot(history.history['acc'], label='train_acc')
-# plt.plot(history.history['val_acc'], label='val_acc')
-# plt.legend()
-# plt.savefig('./image/acc.png')
-# plt.show()
-
-# lr
-# fig = plt.figure(figsize=(12, 5))
-# plt.plot(history.history['lr'], label='leraning rate')
-# plt.legend()
-# plt.savefig('./image/lr.png')
-# plt.show()
 
 
 # print("*********************************************************")
@@ -513,3 +467,32 @@ for i, horizon in enumerate(horizons):
 #             mean_absolute_error(a2, p2),
 #             sqrt(mean_squared_error(a2, p2)),
 #             horizon))
+
+
+plot_samples=500
+max_horizon = horizons[-1]
+plots = len(horizons)
+
+fig = plt.figure(figsize=(14, 5 * plots))
+fig.suptitle("Model Prediction at each Horizon")
+
+for i, horizon in enumerate(horizons):
+    plt.subplot(plots, 1, i+1)
+    
+    len_adjust = max_horizon-horizon # ensure all have same lenght
+    
+    real = features['wind_speed'][sequence_offset+row_split+horizon+len_adjust:].values
+    pred = predicted_signal[len_adjust:-horizon,i]
+    
+    plt.plot(real[:plot_samples], label='observed')
+    plt.plot(pred[:plot_samples], label='predicted')
+    plt.title("Prediction for {} Hour Horizon".format(horizon))
+    plt.xlabel("Hour")
+    plt.ylabel("Wind Speed (m/s)")
+    plt.legend()
+    plt.tight_layout()
+    # plt.show()
+    plt.savefig('./image/result_' + filename + '.png')
+    
+fig.tight_layout()
+plt.subplots_adjust(top=0.95)  
